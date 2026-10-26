@@ -366,7 +366,8 @@ Use the mode.
     reading only the frontmatter of each `SKILL.md`. It is far more forgiving
     than `load_skills_from_dir`, because an invalid skill is logged and skipped,
     and a base path that is not a directory produces a warning and an empty dict
-    instead of an exception.
+    instead of an exception. A child whose directory metadata cannot be read is
+    reported through the same log or `on_error` path.
 *   **Seeing what was skipped**: a skipped skill only reaches a log, so it
     otherwise vanishes from the catalog with no signal. Pass `on_error` to get
     the skill ID and the exception instead of the warning: return from it to

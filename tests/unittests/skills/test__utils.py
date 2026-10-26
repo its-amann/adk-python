@@ -16,7 +16,10 @@
 
 import asyncio
 import builtins
+import contextlib
+import errno
 import io
+import os
 import pathlib
 import struct
 import threading
@@ -584,6 +587,155 @@ def test_list_skills_in_dir_on_error_can_abort(tmp_path):
 
   with pytest.raises(ValueError, match="does not match directory"):
     list_skills_in_dir(_skills_dir_with_one_invalid(tmp_path), on_error=strict)
+
+
+def _skills_dir_with_blocked_child(tmp_path):
+  """Builds one valid skill, one plain file, and one blocked directory."""
+  skills_dir = tmp_path / "skills"
+  skills_dir.mkdir()
+  (skills_dir / "good").mkdir()
+  (skills_dir / "good" / "SKILL.md").write_text(
+      "---\nname: good\ndescription: desc\n---\nbody"
+  )
+  blocked = skills_dir / "blocked-skill"
+  blocked.mkdir()
+  (blocked / "SKILL.md").write_text(
+      "---\nname: blocked-skill\ndescription: desc\n---\nbody"
+  )
+  (skills_dir / "notes.txt").write_text("not a skill")
+  return skills_dir, blocked
+
+
+@contextlib.contextmanager
+def _deny_child_metadata(blocked):
+  """Raise PermissionError from os.stat for one child.
+
+  The failure is injected at the stat boundary. Path.is_dir() is forced to
+  return False for that child, which is what Python 3.14 and 3.15 do when
+  stat fails. Mocking is_dir() to raise would hide that change.
+  """
+  real_stat = os.stat
+  real_is_dir = pathlib.Path.is_dir
+  denied = {
+      os.fspath(blocked),
+      os.fspath(blocked.resolve()),
+  }
+
+  def fake_stat(path, *args, **kwargs):
+    if os.fspath(path) in denied:
+      raise PermissionError(
+          errno.EACCES, "Permission denied", os.fspath(blocked)
+      )
+    return real_stat(path, *args, **kwargs)
+
+  def fake_is_dir(self, *args, **kwargs):
+    if os.fspath(self) in denied:
+      return False
+    return real_is_dir(self, *args, **kwargs)
+
+  with (
+      mock.patch("os.stat", side_effect=fake_stat),
+      mock.patch.object(pathlib.Path, "is_dir", fake_is_dir),
+  ):
+    yield
+
+
+@mock.patch("logging.warning")
+def test_list_skills_in_dir_reports_inaccessible_directory_to_on_error(
+    mock_logging_warning, tmp_path
+):
+  """on_error receives a child whose directory metadata cannot be read."""
+  skills_dir, blocked = _skills_dir_with_blocked_child(tmp_path)
+  failures = []
+
+  with _deny_child_metadata(blocked):
+    skills = list_skills_in_dir(
+        skills_dir,
+        on_error=lambda skill_id, error: failures.append((skill_id, error)),
+    )
+
+  assert list(skills) == ["good"]
+  assert [skill_id for skill_id, _ in failures] == ["blocked-skill"]
+  assert isinstance(failures[0][1], PermissionError)
+  mock_logging_warning.assert_not_called()
+
+
+@mock.patch("logging.warning")
+def test_list_skills_in_dir_logs_inaccessible_directory_without_on_error(
+    mock_logging_warning, tmp_path
+):
+  """Without on_error, an inaccessible child is logged and skipped."""
+  skills_dir, blocked = _skills_dir_with_blocked_child(tmp_path)
+
+  with _deny_child_metadata(blocked):
+    skills = list_skills_in_dir(skills_dir)
+
+  assert list(skills) == ["good"]
+  mock_logging_warning.assert_called_once()
+  args, _ = mock_logging_warning.call_args
+  assert "Skipping invalid skill" in args[0]
+  assert args[1] == "blocked-skill"
+
+
+def test_list_skills_in_dir_on_error_can_abort_for_inaccessible_directory(
+    tmp_path,
+):
+  """Raising from on_error aborts when directory metadata cannot be read."""
+  skills_dir, blocked = _skills_dir_with_blocked_child(tmp_path)
+
+  def strict(skill_id, error):
+    del skill_id  # Unused: the error already names the skill.
+    raise error
+
+  with _deny_child_metadata(blocked):
+    with pytest.raises(PermissionError, match="Permission denied"):
+      list_skills_in_dir(skills_dir, on_error=strict)
+
+
+def test_list_skills_in_dir_reports_unsearchable_directory(tmp_path):
+  """Children of a non searchable skills directory are reported to on_error."""
+  if not hasattr(os, "geteuid") or os.geteuid() == 0:
+    pytest.skip("directory search permission is not enforced for this user")
+
+  skills_dir, _ = _skills_dir_with_blocked_child(tmp_path)
+  failures = []
+  # Readable, but not searchable: listing works and stat of each child fails.
+  skills_dir.chmod(0o644)
+  try:
+    skills = list_skills_in_dir(
+        skills_dir,
+        on_error=lambda skill_id, error: failures.append((skill_id, error)),
+    )
+  finally:
+    skills_dir.chmod(0o755)
+
+  assert skills == {}
+  assert sorted(skill_id for skill_id, _ in failures) == [
+      "blocked-skill",
+      "good",
+      "notes.txt",
+  ]
+  assert all(isinstance(error, PermissionError) for _, error in failures)
+
+
+def test_list_skills_in_dir_skips_broken_symlink(tmp_path):
+  """A dangling symlink is skipped and is not reported as a skill failure."""
+  skills_dir = tmp_path / "skills"
+  skills_dir.mkdir()
+  (skills_dir / "good").mkdir()
+  (skills_dir / "good" / "SKILL.md").write_text(
+      "---\nname: good\ndescription: desc\n---\nbody"
+  )
+  (skills_dir / "missing").symlink_to(skills_dir / "nowhere")
+  failures = []
+
+  skills = list_skills_in_dir(
+      skills_dir,
+      on_error=lambda skill_id, error: failures.append((skill_id, error)),
+  )
+
+  assert list(skills) == ["good"]
+  assert failures == []
 
 
 def test__load_skill_from_zip_bytes():

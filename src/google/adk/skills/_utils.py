@@ -17,9 +17,11 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import io
 import logging
 import pathlib
+import stat
 from typing import Any
 from typing import Callable
 from typing import cast
@@ -537,6 +539,18 @@ def _read_skill_properties(
   return models.Frontmatter.model_validate(parsed)
 
 
+# OS errors pathlib treated as "not a directory" before Python 3.14.
+# A missing path or broken symlink is still not an inaccessible skill.
+# Every other OSError, including a permission failure, must reach on_error:
+# Path.is_dir() returns False for those on Python 3.14 and later.
+_NON_DIRECTORY_STAT_ERRNOS = frozenset({
+    errno.ENOENT,
+    errno.ENOTDIR,
+    errno.EBADF,
+    errno.ELOOP,
+})
+
+
 def _list_skills_in_dir(
     skills_base_path: Union[str, pathlib.Path],
     on_error: Callable[[str, Exception], None] | None = None,
@@ -546,10 +560,11 @@ def _list_skills_in_dir(
   Args:
     skills_base_path: Path to the base directory containing skills.
     on_error: Called with the skill ID and the error when a skill cannot be
-      listed, in place of the default warning log. Return normally to skip that
-      skill and carry on, or raise to abort the listing. Without it an invalid
-      skill is only logged, so it drops out of the result with no other signal
-      to the caller.
+      listed, in place of the default warning log. That includes a child whose
+      directory metadata cannot be read. Return normally to skip that skill
+      and carry on, or raise to abort the listing. Without it an invalid skill
+      is only logged, so it drops out of the result with no other signal to
+      the caller.
 
   Returns:
     Dictionary mapping skill IDs to their frontmatter.
@@ -566,11 +581,33 @@ def _list_skills_in_dir(
     )
     return skills
 
+  def _report_skill_error(skill_id: str, error: Exception) -> None:
+    if on_error is not None:
+      on_error(skill_id, error)
+      return
+    # log invalid skills during listing and skip them
+    logging.warning(
+        "Skipping invalid skill '%s' in directory '%s': %s",
+        skill_id,
+        skills_base_path,
+        error,
+    )
+
   for skill_dir in sorted(skills_base_path.iterdir()):
-    if not skill_dir.is_dir():
+    skill_id = skill_dir.name
+    try:
+      # stat() raises when metadata cannot be read. Path.is_dir() returns
+      # False for every OSError on Python 3.14+, so that check would skip
+      # the child before on_error runs.
+      child_is_dir = stat.S_ISDIR(skill_dir.stat().st_mode)
+    except OSError as error:
+      if error.errno in _NON_DIRECTORY_STAT_ERRNOS:
+        continue
+      _report_skill_error(skill_id, error)
+      continue
+    if not child_is_dir:
       continue
 
-    skill_id = skill_dir.name
     try:
       frontmatter = _read_skill_properties(skill_dir)
       if skill_id != frontmatter.name:
@@ -579,17 +616,8 @@ def _list_skills_in_dir(
             f" name '{skill_id}'."
         )
       skills[skill_id] = frontmatter
-    except (FileNotFoundError, ValueError, ValidationError) as e:
-      if on_error is not None:
-        on_error(skill_id, e)
-        continue
-      # log invalid skills during listing and skip them
-      logging.warning(
-          "Skipping invalid skill '%s' in directory '%s': %s",
-          skill_id,
-          skills_base_path,
-          e,
-      )
+    except (FileNotFoundError, ValueError, ValidationError) as error:
+      _report_skill_error(skill_id, error)
   return skills
 
 
