@@ -18,6 +18,9 @@ from unittest import mock
 from unittest.mock import AsyncMock
 
 from google.adk.agents.llm_agent import Agent
+from google.adk.events._internal_metadata import INTERNAL_METADATA_PREFIX
+from google.adk.events._internal_metadata import LIVE_USAGE_KEY
+from google.adk.events._internal_metadata import RESTORED_EVENT_KEY
 from google.adk.events.event import Event
 from google.adk.events.event import TOOL_DISPLAY_NAMES_METADATA_KEY
 from google.adk.flows.llm_flows.core import _finalizer as _model_response_finalizer
@@ -309,6 +312,92 @@ async def test_handle_before_model_callback_plugin_override():
 
 
 # --- Tests for handle_after_model_callback and Grounding Metadata ---
+
+
+async def test_after_model_preserves_same_object_edits():
+  """Metadata restoration must not undo deliberate edits on the same response."""
+  marker = {"connection_id": "connection-1", "sequence": 1}
+  response = LlmResponse(
+      custom_metadata={LIVE_USAGE_KEY: marker},
+      usage_metadata=types.GenerateContentResponseUsageMetadata(
+          total_token_count=15
+      ),
+  )
+
+  def callback(callback_context, llm_response):
+    del callback_context
+    llm_response.usage_metadata = None
+    return llm_response
+
+  agent = Agent(name="test_agent", after_model_callback=callback)
+  context = await testing_utils.create_invocation_context(agent=agent)
+  result = await _model_response_finalizer.handle_after_model_callback(
+      context, response, Event(author=agent.name)
+  )
+  assert result is response
+  assert response.usage_metadata is None
+  assert response.custom_metadata == {LIVE_USAGE_KEY: marker}
+
+
+@pytest.mark.parametrize("kind", ["copy", "fresh", "inplace", "nested"])
+@pytest.mark.parametrize("plugin_callback", [False, True])
+async def test_after_model_preserves_owned_metadata(kind, plugin_callback):
+  """Callback edits preserve internal identity and the callback's public tags."""
+  marker = {"connection_id": "connection-1", "sequence": 2}
+  original = LlmResponse(
+      usage_metadata=types.GenerateContentResponseUsageMetadata(
+          total_token_count=15
+      ),
+      model_version="live-model",
+      live_session_id="provider-session",
+      custom_metadata={LIVE_USAGE_KEY: dict(marker), RESTORED_EVENT_KEY: True},
+  )
+
+  def callback(callback_context, llm_response):
+    del callback_context
+    metadata = {
+        "user_tag": "voice",
+        RESTORED_EVENT_KEY: False,
+        INTERNAL_METADATA_PREFIX + "callback_owned": "kept",
+    }
+    if kind == "copy":
+      return llm_response.model_copy(update={"custom_metadata": metadata})
+    if kind == "fresh":
+      return Event(author="test_agent", custom_metadata=metadata)
+    if kind == "nested":
+      llm_response.custom_metadata[LIVE_USAGE_KEY]["sequence"] = 99
+      llm_response.custom_metadata["user_tag"] = "voice"
+      llm_response.custom_metadata[
+          INTERNAL_METADATA_PREFIX + "callback_owned"
+      ] = "kept"
+    else:
+      llm_response.custom_metadata = metadata
+
+  agent = Agent(
+      name="test_agent",
+      after_model_callback=None if plugin_callback else callback,
+  )
+  plugins = []
+  if plugin_callback:
+    plugin = BasePlugin(name="metadata-editor")
+    plugin.after_model_callback = AsyncMock(side_effect=callback)
+    plugins = [plugin]
+  context = await testing_utils.create_invocation_context(
+      agent=agent, plugins=plugins
+  )
+  result = await _model_response_finalizer.handle_after_model_callback(
+      context, original, Event(author=agent.name)
+  )
+  response = result if result is not None else original
+  assert response.custom_metadata == {
+      LIVE_USAGE_KEY: marker,
+      RESTORED_EVENT_KEY: True,
+      "user_tag": "voice",
+      INTERNAL_METADATA_PREFIX + "callback_owned": "kept",
+  }
+  assert response.model_version == "live-model"
+  assert response.live_session_id == "provider-session"
+  assert response.usage_metadata.total_token_count == 15
 
 
 @pytest.mark.parametrize(

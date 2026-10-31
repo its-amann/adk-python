@@ -341,6 +341,7 @@ class GeminiLlmConnection(BaseLlmConnection):
         if message.usage_metadata:
           # Remap live token usage to GenerateContentResponse usage metadata.
           self._usage_sequence += 1
+          service_tier = getattr(message.usage_metadata, 'service_tier', None)
           yield LlmResponse(
               usage_metadata=self._to_generate_content_usage_metadata(
                   message.usage_metadata
@@ -351,6 +352,10 @@ class GeminiLlmConnection(BaseLlmConnection):
                   LIVE_USAGE_KEY: {
                       'connection_id': self._usage_connection_id,
                       'sequence': self._usage_sequence,
+                      'api_backend': self._api_backend.value,
+                      'service_tier': getattr(
+                          service_tier, 'value', service_tier
+                      ),
                   }
               },
           )

@@ -2780,6 +2780,7 @@ class BigQueryLoggerConfig:
   # --- generic custom_metadata capture (allowlist) ---
   # Exact keys and/or explicit ``*``-suffixed prefix patterns to capture
   # from ``event.custom_metadata`` into ``attributes.custom_metadata.*``.
+  # Reserved ``__adk_internal_*`` keys are never captured, even explicitly.
   # None/empty preserves today's behavior (only the built-in ``a2a:*`` path).
   custom_metadata_allowlist: list[str] | None = None
 
@@ -5084,6 +5085,25 @@ def _project_schema(
   return [f for f in schema if f.name not in denied]
 
 
+def _live_usage_marker(response: Any) -> dict[str, Any] | None:
+  """Returns valid connection identity, or lets legacy usage logging handle it."""
+  metadata = getattr(response, "custom_metadata", None)
+  marker = metadata.get(LIVE_USAGE_KEY) if isinstance(metadata, dict) else None
+  if not isinstance(marker, dict):
+    return None
+  connection_id = marker.get("connection_id")
+  sequence = marker.get("sequence")
+  if (
+      isinstance(connection_id, str)
+      and 0 < len(connection_id) <= 128
+      and isinstance(sequence, int)
+      and not isinstance(sequence, bool)
+      and 0 < sequence <= 2**63 - 1
+  ):
+    return marker
+  return None
+
+
 def _parse_custom_metadata_allowlist(
     allowlist: Optional[list[str]],
 ) -> tuple[frozenset[str], tuple[str, ...]]:
@@ -5133,43 +5153,63 @@ _NODE_IDENTITY_VIEW_COLUMNS = (
 # Per-event-type column extractions.  Each value is a list of
 # ``"SQL_EXPR AS alias"`` strings that will be appended after the
 # common columns in the view SELECT.
+# Live views expose raw reports. Counter aggregation depends on the provider;
+# keep analytic windows in caller queries so time filters can prune partitions.
 _EVENT_VIEW_DEFS: dict[str, list[str]] = {
     "USER_MESSAGE_RECEIVED": [],
     "LIVE_USAGE": [
         (
-            "CAST(JSON_VALUE(content, '$.usage.prompt') AS INT64) AS"
+            "SAFE_CAST(JSON_VALUE(content, '$.usage.prompt') AS INT64) AS"
             " usage_prompt_tokens"
         ),
         (
-            "CAST(JSON_VALUE(content, '$.usage.completion') AS INT64) AS"
+            "SAFE_CAST(JSON_VALUE(content, '$.usage.completion') AS INT64) AS"
             " usage_completion_tokens"
         ),
         (
-            "CAST(JSON_VALUE(content, '$.usage.total') AS INT64) AS"
+            "SAFE_CAST(JSON_VALUE(content, '$.usage.total') AS INT64) AS"
             " usage_total_tokens"
         ),
         "JSON_VALUE(attributes, '$.model_version') AS model_version",
         "JSON_QUERY(attributes, '$.usage_metadata') AS usage_metadata",
         (
-            "JSON_VALUE(attributes, '$.usage_metadata.traffic_type') AS"
-            " traffic_type"
+            "REGEXP_REPLACE(JSON_VALUE(attributes,"
+            " '$.usage_metadata.traffic_type'), r'^TrafficType\\.', '')"
+            " AS traffic_type"
         ),
         "JSON_VALUE(attributes, '$.live_usage.connection_id') AS connection_id",
         (
-            "CAST(JSON_VALUE(attributes, '$.live_usage.sequence') AS INT64) AS"
-            " sequence"
+            "SAFE_CAST(JSON_VALUE(attributes, '$.live_usage.sequence') AS"
+            " INT64) AS sequence"
         ),
         (
             "JSON_VALUE(attributes, '$.live_usage.live_session_id') AS"
             " live_session_id"
         ),
+        "JSON_VALUE(attributes, '$.live_usage.api_backend') AS api_backend",
+        "JSON_VALUE(attributes, '$.live_usage.service_tier') AS service_tier",
         (
-            "ROW_NUMBER() OVER (PARTITION BY"
-            " JSON_VALUE(attributes, '$.live_usage.connection_id')"
-            " ORDER BY CAST(JSON_VALUE(attributes, '$.live_usage.sequence')"
-            " AS INT64) DESC, timestamp DESC, event_id DESC) = 1"
-            " AS is_latest_for_connection"
+            "SAFE_CAST(JSON_VALUE(attributes,"
+            " '$.usage_metadata.cached_content_token_count') AS INT64) AS"
+            " usage_cached_tokens"
         ),
+        (
+            "SAFE_CAST(JSON_VALUE(attributes,"
+            " '$.usage_metadata.thoughts_token_count') AS INT64) AS"
+            " usage_thinking_tokens"
+        ),
+        (
+            "SAFE_CAST(JSON_VALUE(attributes,"
+            " '$.usage_metadata.tool_use_prompt_token_count') AS INT64) AS"
+            " usage_tool_use_tokens"
+        ),
+        (
+            "SAFE_DIVIDE(SAFE_CAST(JSON_VALUE(attributes,"
+            " '$.usage_metadata.cached_content_token_count') AS INT64),"
+            " SAFE_CAST(JSON_VALUE(content, '$.usage.prompt') AS INT64))"
+            " AS context_cache_hit_rate"
+        ),
+        "JSON_QUERY(attributes, '$.cache_metadata') AS cache_metadata",
     ],
     "LLM_REQUEST": [
         "JSON_VALUE(attributes, '$.model') AS model",
@@ -5750,8 +5790,9 @@ WITH
         NULL
       ) AS tool_call_run_length,
       (
-        event_type = 'LLM_RESPONSE'
-        AND (is_final_llm_response OR NOT turn_has_final_llm_response)
+        (event_type = 'LLM_RESPONSE'
+          AND (is_final_llm_response OR NOT turn_has_final_llm_response))
+        OR event_type = 'LIVE_USAGE'
       ) AS is_usage_row,
       usage_total,
       usage_prompt,
@@ -9557,9 +9598,20 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
     # mandatory boundary — it covers values copied in directly (state_delta
     # via extra_attributes, custom_tags, labels, generic extra attributes),
     # nested structures, `temp:`-scoped keys, and JSON-encoded blobs.
+    # Connection identity is bounded control data, not truncatable content.
+    live_usage = attributes.get("live_usage")
+    connection_id = None
+    if (
+        event_type == "LIVE_USAGE"
+        and isinstance(live_usage, dict)
+        and _live_usage_marker(event_data.source_event)
+    ):
+      connection_id = live_usage.pop("connection_id", None)
     attributes, attrs_truncated = _recursive_smart_truncate(
         attributes, self.config.max_content_length
     )
+    if connection_id is not None:
+      attributes["live_usage"]["connection_id"] = connection_id
     is_truncated = is_truncated or attrs_truncated
 
     # Serialize attributes to JSON string
@@ -9705,6 +9757,8 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
   ) -> None:
     """Logs state changes, HITL events, A2A interactions, and agent responses.
 
+    - Records native Gemini usage snapshots as LIVE_USAGE, independently of
+      model response content. These are not workflow node observations.
     - Records path-bearing source events for workflow observation windows.
     - Checks each event for a non-empty state_delta and logs it as a
       STATE_DELTA event.
@@ -9732,10 +9786,8 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
     """
     callback_ctx = CallbackContext(invocation_context)
 
-    live_usage = (getattr(event, "custom_metadata", None) or {}).get(
-        LIVE_USAGE_KEY
-    )
-    if isinstance(live_usage, dict) and event.usage_metadata is not None:
+    live_usage = _live_usage_marker(event)
+    if live_usage is not None and event.usage_metadata is not None:
       usage = event.usage_metadata
       await self._log_event(
           "LIVE_USAGE",
@@ -9750,16 +9802,29 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
           event_data=EventData(
               source_event=event,
               model_version=event.model_version,
-              usage_metadata=usage,
+              usage_metadata=usage.model_dump(mode="json", exclude_none=True),
+              cache_metadata=getattr(event, "cache_metadata", None),
               extra_attributes={
                   "live_usage": {
                       "connection_id": live_usage.get("connection_id"),
                       "sequence": live_usage.get("sequence"),
                       "live_session_id": event.live_session_id,
+                      "api_backend": live_usage.get("api_backend"),
+                      "service_tier": live_usage.get("service_tier"),
                   }
               },
           ),
       )
+      if (
+          event.content is None
+          and event.error_code is None
+          and not event.actions.state_delta
+          and not event.actions.model_dump(
+              exclude={"state_delta"}, exclude_defaults=True, exclude_none=True
+          )
+          and getattr(event, "output", None) is None
+      ):
+        return
 
     # A later before_model callback may short-circuit the model call. ADK
     # intentionally skips every after_model callback in that case, so the
@@ -9768,7 +9833,7 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
     # expected top span at this boundary. Streaming chunks stay attached to
     # their live llm_request span until the final response callback.
     if (
-        not isinstance(live_usage, dict)
+        not (live_usage is not None and event.usage_metadata is not None)
         and getattr(event, "partial", None) is not True
     ):
       TraceManager.pop_span(expected_kind="llm_request")
@@ -10459,6 +10524,8 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
       )
       attributes["tools"] = tools
 
+    # A usage-only predecessor may have ended without a final content frame.
+    TraceManager.pop_span(expected_kind="llm_request")
     TraceManager.push_span(callback_context, "llm_request")
     await self._log_event(
         "LLM_REQUEST",
@@ -10489,14 +10556,24 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
     SSE produces one terminal response per model call, while legacy aggregators
     and mixed LiteLLM streams can emit multiple terminal responses.
 
+    Native standalone Live snapshots are recorded as LIVE_USAGE by on_event.
+    CFC users querying v_llm_response for tokens should also read v_live_usage.
+    If LIVE_USAGE is filtered, CFC retains its LLM_RESPONSE usage fallback.
+
     Args:
         callback_context: The callback context.
         llm_response: The LLM response object.
     """
-    if (
-        isinstance(llm_response, LlmResponse)
+    live_usage = _live_usage_marker(llm_response)
+    defer_usage = (
+        live_usage is not None
         and llm_response.usage_metadata is not None
-        and LIVE_USAGE_KEY in (llm_response.custom_metadata or {})
+        and not self._event_type_filtered("LIVE_USAGE")
+    )
+    if (
+        defer_usage
+        and llm_response.content is None
+        and llm_response.error_code is None
     ):
       # CFC also calls this hook for live events; on_event owns their usage.
       return
@@ -10512,8 +10589,9 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
       if part_truncated:
         is_truncated = True
 
-    if llm_response.usage_metadata:
-      usage = llm_response.usage_metadata
+    usage_metadata = None if defer_usage else llm_response.usage_metadata
+    if usage_metadata:
+      usage = usage_metadata
       usage_dict = {}
       if hasattr(usage, "prompt_token_count"):
         usage_dict["prompt"] = usage.prompt_token_count
@@ -10536,7 +10614,6 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
     duration = 0
     tfft = None
     extra_attributes: dict[str, Any] = {}
-    usage_metadata = llm_response.usage_metadata
     cache_metadata = getattr(llm_response, "cache_metadata", None)
 
     if is_partial:
@@ -10585,8 +10662,13 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
       # cache_metadata presence wins the "explicit" label even if some of the
       # cached tokens came from provider-side implicit caching.
       cached = bool(
-          usage_metadata
-          and (getattr(usage_metadata, "cached_content_token_count", 0) or 0)
+          llm_response.usage_metadata
+          and (
+              getattr(
+                  llm_response.usage_metadata, "cached_content_token_count", 0
+              )
+              or 0
+          )
           > 0
       )
       if not cached:

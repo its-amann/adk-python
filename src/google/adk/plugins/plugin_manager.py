@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import nullcontext
+import copy
 import logging
 import sys
 from typing import Any
@@ -28,6 +29,7 @@ from google.genai import types
 
 from ..agents._callback_metadata import _callback_scope
 from ..agents._callback_metadata import CallbackType
+from ..events._internal_metadata import internal_metadata
 from .base_plugin import BasePlugin
 
 if TYPE_CHECKING:
@@ -323,6 +325,14 @@ class PluginManager:
         else nullcontext()
     )
 
+    llm_response = kwargs.get("llm_response")
+    owned_metadata = (
+        copy.deepcopy(
+            internal_metadata(getattr(llm_response, "custom_metadata", None))
+        )
+        if callback_name == "after_model_callback"
+        else {}
+    )
     with callback_scope:
       for plugin in self.plugins:
         # Each plugin might not implement all callbacks. The base class provides
@@ -347,6 +357,13 @@ class PluginManager:
           )
           logger.error(error_message, exc_info=True)
           raise RuntimeError(error_message) from e
+        finally:
+          if owned_metadata and llm_response is not None:
+            # Each later plugin must see the original model-owned identity.
+            llm_response.custom_metadata = {
+                **(llm_response.custom_metadata or {}),
+                **copy.deepcopy(owned_metadata),
+            }
 
     return None
 

@@ -46,6 +46,8 @@ On restore, the reserved keys are removed first and the marker is set afterwards
 
 Keys that ADK code sets on its own events are kept. Agents, plugins, and callbacks run inside ADK, so the reserved namespace is available to them. When a plugin's `on_event_callback` returns a replacement event with its own `custom_metadata`, the reserved keys of the original event are carried over.
 
+Gemini Live usage events also carry reserved connection and sequence metadata. It survives after-model callback replacements and in-place metadata edits, stays on stored events and Python Runner output, and is removed from the public exports below.
+
 Reserved keys stay on stored events. So that API output does not change, they are removed from these outputs:
 
 - **API server**: events returned by the session endpoints (create, get, list and update) and streamed by `/run`, `/run_sse` and `/run_live`.

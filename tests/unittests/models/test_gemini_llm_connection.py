@@ -15,6 +15,7 @@
 from typing import Optional
 from unittest import mock
 
+from google.adk.events._internal_metadata import LIVE_USAGE_KEY
 from google.adk.models.gemini_llm_connection import GeminiLlmConnection
 from google.adk.utils.variant_utils import GoogleLLMVariant
 from google.genai import types
@@ -32,9 +33,15 @@ async def test_live_usage_identifies_each_connection_and_orders_snapshots(
   session.session_id = 'resumed-session'
 
   async def receive():
-    yield types.LiveServerMessage(
-        usage_metadata=types.UsageMetadata(total_token_count=12)
-    )
+    for count in (12, 25, 4):
+      yield types.LiveServerMessage(
+          usage_metadata=types.UsageMetadata(
+              total_token_count=count, service_tier=types.ServiceTier.PRIORITY
+          ),
+          server_content=types.LiveServerContent(
+              model_turn=types.Content(parts=[types.Part(text='hello')])
+          ),
+      )
 
   session.receive = mock.Mock(side_effect=receive)
   connection = GeminiLlmConnection(session, api_backend=backend)
@@ -43,13 +50,25 @@ async def test_live_usage_identifies_each_connection_and_orders_snapshots(
   reconnected = GeminiLlmConnection(session, api_backend=backend)
   third = [response async for response in reconnected.receive()]
 
-  first_key = first[0].custom_metadata['__adk_internal_live_usage']
-  second_key = second[0].custom_metadata['__adk_internal_live_usage']
-  third_key = third[0].custom_metadata['__adk_internal_live_usage']
-  assert first_key['sequence'] == 1
-  assert second_key == {**first_key, 'sequence': 2}
-  assert third_key['sequence'] == 1
-  assert third_key['connection_id'] != first_key['connection_id']
+  first_keys = [
+      r.custom_metadata[LIVE_USAGE_KEY] for r in first if r.usage_metadata
+  ]
+  second_keys = [
+      r.custom_metadata[LIVE_USAGE_KEY] for r in second if r.usage_metadata
+  ]
+  third_keys = [
+      r.custom_metadata[LIVE_USAGE_KEY] for r in third if r.usage_metadata
+  ]
+  assert [key['sequence'] for key in first_keys] == [1, 2, 3]
+  assert [key['sequence'] for key in second_keys] == [4, 5, 6]
+  assert [key['sequence'] for key in third_keys] == [1, 2, 3]
+  assert len({key['connection_id'] for key in first_keys + second_keys}) == 1
+  assert third_keys[0]['connection_id'] != first_keys[0]['connection_id']
+  assert first_keys[0]['api_backend'] == backend.value
+  assert first_keys[0]['service_tier'] == 'priority'
+  assert [
+      r.usage_metadata.total_token_count for r in first if r.usage_metadata
+  ] == [12, 25, 4]
   assert first[0].live_session_id == third[0].live_session_id
   assert first[0].usage_metadata.total_token_count == 12
 
