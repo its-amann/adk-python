@@ -204,6 +204,266 @@ async def test_live_usage_invalid_marker_keeps_legacy_usage(
   assert json.loads(rows[0]["content"])["usage"]["total"] == 15
 
 
+async def test_live_usage_after_model_alone_records_usage(
+    bq_plugin_inst,
+    invocation_context,
+    live_usage_event,
+    mock_write_client,
+    dummy_arrow_schema,
+):
+  """Evaluation's agent route has no subsequent on-event callback."""
+  bq_plugin_inst.config.max_content_length = 1
+  response = llm_response_lib.LlmResponse(
+      usage_metadata=live_usage_event.usage_metadata,
+      custom_metadata=live_usage_event.custom_metadata,
+      model_version=live_usage_event.model_version,
+  )
+  for _ in range(2):
+    await bq_plugin_inst.after_model_callback(
+        callback_context=CallbackContext(invocation_context),
+        llm_response=response,
+    )
+  await bq_plugin_inst.flush()
+  rows = await _get_captured_rows_async(mock_write_client, dummy_arrow_schema)
+  assert [row["event_type"] for row in rows] == ["LIVE_USAGE"]
+  assert (
+      json.loads(rows[0]["attributes"])["live_usage"]["connection_id"]
+      == "connection-1"
+  )
+
+
+@pytest.mark.parametrize("error", [RuntimeError, asyncio.CancelledError])
+async def test_live_usage_failed_observation_can_be_retried(
+    bq_plugin_inst,
+    invocation_context,
+    live_usage_event,
+    mock_write_client,
+    dummy_arrow_schema,
+    error,
+):
+  """A failed callback attempt must not suppress the later event observer."""
+  with mock.patch.object(
+      bq_plugin_inst,
+      "_log_event",
+      wraps=bq_plugin_inst._log_event,
+      side_effect=error("interrupted"),
+  ):
+    if error is asyncio.CancelledError:
+      with pytest.raises(asyncio.CancelledError):
+        await bq_plugin_inst.after_model_callback(
+            callback_context=CallbackContext(invocation_context),
+            llm_response=live_usage_event,
+        )
+    else:
+      await bq_plugin_inst.after_model_callback(
+          callback_context=CallbackContext(invocation_context),
+          llm_response=live_usage_event,
+      )
+  await bq_plugin_inst.on_event_callback(
+      invocation_context=invocation_context, event=live_usage_event
+  )
+  await bq_plugin_inst.flush()
+  rows = await _get_captured_rows_async(mock_write_client, dummy_arrow_schema)
+  assert [row["event_type"] for row in rows] == ["LIVE_USAGE"]
+
+
+async def test_live_usage_concurrent_callbacks_record_one_observation(
+    bq_plugin_inst,
+    invocation_context,
+    live_usage_event,
+    mock_write_client,
+    dummy_arrow_schema,
+):
+  """Both hooks can observe the same report without adding duplicate rows."""
+  await asyncio.gather(
+      bq_plugin_inst.after_model_callback(
+          callback_context=CallbackContext(invocation_context),
+          llm_response=live_usage_event,
+      ),
+      bq_plugin_inst.on_event_callback(
+          invocation_context=invocation_context, event=live_usage_event
+      ),
+      bq_plugin_inst.on_event_callback(
+          invocation_context=invocation_context, event=live_usage_event
+      ),
+  )
+  await bq_plugin_inst.flush()
+  rows = await _get_captured_rows_async(mock_write_client, dummy_arrow_schema)
+  assert [row["event_type"] for row in rows] == ["LIVE_USAGE"]
+
+
+async def test_live_usage_duplicate_history_is_bounded(
+    bq_plugin_inst,
+    invocation_context,
+    live_usage_event,
+):
+  """Recent duplicates are suppressed without retaining every past report."""
+  with mock.patch.object(bq_plugin_inst, "_log_event") as log_event:
+    for sequence in [*range(1, 1026), 1025, 1]:
+      live_usage_event.custom_metadata[LIVE_USAGE_KEY]["sequence"] = sequence
+      await bq_plugin_inst.after_model_callback(
+          callback_context=CallbackContext(invocation_context),
+          llm_response=live_usage_event,
+      )
+  assert log_event.await_count == 1026
+
+
+async def test_live_and_unary_usage_share_json_enum_encoding(
+    bq_plugin_inst,
+    invocation_context,
+    live_usage_event,
+    mock_write_client,
+    dummy_arrow_schema,
+):
+  """Queries see the same traffic and modality values in both event types."""
+  context = CallbackContext(invocation_context)
+  await bq_plugin_inst.after_model_callback(
+      callback_context=context, llm_response=live_usage_event
+  )
+  live_usage_event.custom_metadata = None
+  await bq_plugin_inst.after_model_callback(
+      callback_context=context, llm_response=live_usage_event
+  )
+  await bq_plugin_inst.flush()
+  rows = await _get_captured_rows_async(mock_write_client, dummy_arrow_schema)
+  assert [row["event_type"] for row in rows] == ["LIVE_USAGE", "LLM_RESPONSE"]
+  usages = [json.loads(row["attributes"])["usage_metadata"] for row in rows]
+  assert usages[0] == usages[1]
+  assert usages[0]["traffic_type"] == types.TrafficType.ON_DEMAND.value
+
+
+async def test_filtered_live_usage_preserves_span_and_eval_totals(
+    bq_plugin_inst,
+    invocation_context,
+    live_usage_event,
+    mock_write_client,
+    dummy_arrow_schema,
+):
+  """Fallback usage keeps accounting while a later text response ends timing."""
+  bq_plugin_inst.config.event_denylist = ["LIVE_USAGE"]
+  tm = bigquery_agent_analytics_plugin.TraceManager
+  context = CallbackContext(invocation_context)
+  tm.ensure_invocation_span(context)
+  await bq_plugin_inst.on_user_message_callback(
+      invocation_context=invocation_context,
+      user_message=types.Content(role="user", parts=[types.Part(text="hello")]),
+  )
+  tm.push_span(context, "agent")
+  agent_span = tm.get_current_span_id()
+  tm.push_span(context, "llm_request")
+  pending_span = tm.get_current_span_id()
+  try:
+    await bq_plugin_inst.after_model_callback(
+        callback_context=context, llm_response=live_usage_event
+    )
+    assert tm.get_current_span_id() == pending_span
+    assert tm.get_first_token_time(pending_span) is None
+    await bq_plugin_inst.after_model_callback(
+        callback_context=context,
+        llm_response=llm_response_lib.LlmResponse(
+            content=types.Content(
+                role="model", parts=[types.Part(text="done")]
+            ),
+            turn_complete=True,
+        ),
+    )
+    assert tm.get_current_span_id() == agent_span
+    await bq_plugin_inst.flush()
+    rows = await _get_captured_rows_async(mock_write_client, dummy_arrow_schema)
+    turn = _EvalViewSqlEvaluator(
+        bigquery_agent_analytics_plugin._build_eval_turn_view_sql("p.d.t")
+    ).run(rows)[0]
+    assert turn["total_tokens"] == 15
+  finally:
+    tm.clear_stack()
+
+
+@pytest.mark.parametrize("metadata", ["pause", "a2a"])
+async def test_live_usage_keeps_noncontent_event_handlers(
+    bq_plugin_inst,
+    invocation_context,
+    live_usage_event,
+    mock_write_client,
+    dummy_arrow_schema,
+    metadata,
+):
+  """A usage report may also carry a tool pause or an A2A interaction."""
+  if metadata == "pause":
+    live_usage_event.long_running_tool_ids = {"paused-call"}
+    expected = "TOOL_PAUSED"
+  else:
+    live_usage_event.custom_metadata["a2a:response"] = {"message": "ready"}
+    expected = "A2A_INTERACTION"
+  await bq_plugin_inst.on_event_callback(
+      invocation_context=invocation_context, event=live_usage_event
+  )
+  await bq_plugin_inst.flush()
+  rows = await _get_captured_rows_async(mock_write_client, dummy_arrow_schema)
+  assert [row["event_type"] for row in rows] == ["LIVE_USAGE", expected]
+
+
+async def test_live_usage_control_id_is_sanitized_without_truncation(
+    bq_plugin_inst,
+    invocation_context,
+    live_usage_event,
+    mock_write_client,
+    dummy_arrow_schema,
+):
+  """Control IDs still pass the credential-redaction boundary."""
+  bq_plugin_inst.config.max_content_length = 1
+  live_usage_event.custom_metadata[LIVE_USAGE_KEY][
+      "connection_id"
+  ] = '{"access_token":"test-only-credential"}'
+  await bq_plugin_inst.on_event_callback(
+      invocation_context=invocation_context, event=live_usage_event
+  )
+  await bq_plugin_inst.flush()
+  rows = await _get_captured_rows_async(mock_write_client, dummy_arrow_schema)
+  assert len(rows) == 1
+  assert "test-only-credential" not in rows[0]["attributes"]
+
+
+@pytest.mark.parametrize("filtered", [False, True])
+async def test_live_usage_agent_completion_closes_only_its_own_spans(
+    bq_plugin_inst,
+    invocation_context,
+    live_usage_event,
+    mock_write_client,
+    dummy_arrow_schema,
+    filtered,
+):
+  """Usage-only terminal turns retain the agent and invocation span IDs."""
+  if filtered:
+    bq_plugin_inst.config.event_denylist = ["LIVE_USAGE"]
+  tm = bigquery_agent_analytics_plugin.TraceManager
+  context = CallbackContext(invocation_context)
+  tm.ensure_invocation_span(context)
+  invocation_span = tm.get_current_span_id()
+  tm.push_span(context, "agent")
+  agent_span = tm.get_current_span_id()
+  tm.push_span(context, "llm_request")
+  request_span = tm.get_current_span_id()
+  try:
+    await bq_plugin_inst.after_model_callback(
+        callback_context=context, llm_response=live_usage_event
+    )
+    assert tm.get_current_span_id() == request_span
+    assert tm.get_first_token_time(request_span) is None
+    await bq_plugin_inst.after_agent_callback(
+        agent=invocation_context.agent, callback_context=context
+    )
+    await bq_plugin_inst.after_run_callback(
+        invocation_context=invocation_context
+    )
+    await bq_plugin_inst.flush()
+    rows = await _get_captured_rows_async(mock_write_client, dummy_arrow_schema)
+    completed = {row["event_type"]: row for row in rows}
+    assert completed["AGENT_COMPLETED"]["span_id"] == agent_span
+    assert completed["INVOCATION_COMPLETED"]["span_id"] == invocation_span
+  finally:
+    tm.clear_stack()
+
+
 async def test_live_usage_does_not_observe_workflow_nodes(
     bq_plugin_inst,
     invocation_context,
@@ -299,10 +559,6 @@ def test_live_usage_marker_is_private_at_export_boundaries(live_usage_event):
   assert public_event(live_usage_event).custom_metadata is None
   assert public_session(session).events[0].custom_metadata is None
   assert LIVE_USAGE_KEY in live_usage_event.custom_metadata
-  assert (
-      "LIVE_USAGE"
-      in bigquery_agent_analytics_plugin.BigQueryAgentAnalyticsPlugin.on_event_callback.__doc__
-  )
 
 
 async def test_live_usage_is_not_counted_again_by_after_model(
@@ -13553,6 +13809,7 @@ class _EvalViewSqlEvaluator:
 
   _TOKEN_RE = re.compile(
       r"(?P<space>\s+)"
+      r"|(?P<comment>--[^\r\n]*)"
       r"|(?P<string>[rR]?(?:'(?:\\.|[^'\\])*'|\"(?:\\.|[^\"\\])*\"))"
       r"|(?P<number>\d+)"
       r"|(?P<name>`[^`]*`|[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)"
@@ -13595,7 +13852,7 @@ class _EvalViewSqlEvaluator:
     while pos < len(sql):
       match = self._TOKEN_RE.match(sql, pos)
       assert match, f"Unexpected SQL text: {sql[pos:pos + 40]!r}"
-      if match.lastgroup != "space":
+      if match.lastgroup not in {"space", "comment"}:
         self._tokens.append((match.lastgroup, match.group()))
       pos = match.end()
     self._pos, self._end = 0, len(self._tokens)

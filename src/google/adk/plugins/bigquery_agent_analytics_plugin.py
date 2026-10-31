@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import atexit
 import base64
+from collections import OrderedDict
 import collections.abc
 import concurrent.futures
 from concurrent.futures import Future as ConcurrentFuture
@@ -102,6 +103,7 @@ from ..agents.base_agent import BaseAgent
 from ..agents.callback_context import CallbackContext
 from ..events._internal_metadata import LIVE_USAGE_KEY
 from ..events._internal_metadata import public_metadata
+from ..events.event import Event
 from ..models.llm_request import LlmRequest
 from ..models.llm_response import LlmResponse
 from ..platform.thread import create_thread
@@ -124,7 +126,6 @@ from .base_plugin import BasePlugin
 
 if TYPE_CHECKING:
   from ..agents.invocation_context import InvocationContext
-  from ..events.event import Event
 
 # Defined in _callback_helpers, which the observability plugins share, and
 # still importable from this module: _LLM_RESPONSE_ERROR_CODES was defined
@@ -2544,6 +2545,8 @@ class BigQueryLoggerConfig:
         preserves today's behavior (only the built-in ``a2a:*`` path runs).
         Captured values pass the same safety pipeline (truncation, sensitive-key
         redaction, circular-reference handling) as all other logged content.
+        Keys with the ``__adk_internal_`` prefix are never captured, even when
+        explicitly allowlisted.
       payload_column_denylist: Payload columns to project OUT of the table at
         write time. Only the projectable payload columns ``content`` /
         ``content_parts`` / ``attributes`` / ``latency_ms`` may be listed;
@@ -5085,9 +5088,8 @@ def _project_schema(
   return [f for f in schema if f.name not in denied]
 
 
-def _live_usage_marker(response: Any) -> dict[str, Any] | None:
+def _live_usage_marker(metadata: Any) -> dict[str, Any] | None:
   """Returns valid connection identity, or lets legacy usage logging handle it."""
-  metadata = getattr(response, "custom_metadata", None)
   marker = metadata.get(LIVE_USAGE_KEY) if isinstance(metadata, dict) else None
   if not isinstance(marker, dict):
     return None
@@ -5789,6 +5791,7 @@ WITH
         ),
         NULL
       ) AS tool_call_run_length,
+      -- Like EvaluationGenerator, sum raw reports, not cumulative deltas.
       (
         (event_type = 'LLM_RESPONSE'
           AND (is_final_llm_response OR NOT turn_has_final_llm_response))
@@ -6607,6 +6610,10 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
   ``extract_error_from_result`` override flags, is recorded as
   ``TOOL_COMPLETED`` unless ``BigQueryLoggerConfig.tool_result_classifier``
   flags the same result.
+
+  For native Live, register this plugin before on-event plugins that return a
+  replacement event: returning an event intentionally skips later plugins.
+  CFC and evaluation routes also record Live usage in after-model callbacks.
   """
 
   def __init__(
@@ -6715,6 +6722,7 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
     self._generation = 0
     # Guards ownership changes of _loop_state_by_loop: unsynchronized iteration raced concurrent insertion.
     self._loop_states_guard = threading.RLock()
+    self._live_usage_seen: OrderedDict[tuple[str, int], object] = OrderedDict()
     self._credentials = credentials
     self._custom_credentials = credentials is not None
     self.client: bigquery.Client | None = None
@@ -8460,6 +8468,7 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
     state["_workflow_segments_guard"] = None
     state["client"] = None
     state["_loop_state_by_loop"] = {}
+    state["_live_usage_seen"] = OrderedDict()
     state["_loop_state_futures"] = {}
     state["_builder_waiters"] = {}
     state["_workflow_segments"] = {}
@@ -8498,6 +8507,7 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
     state.pop("_setup_locks", None)
     state.pop("_setup_locks_guard", None)
     self.__dict__.update(state)
+    self._live_usage_seen = OrderedDict()
     self._setup_guard = threading.Lock()
     self._setup_future = None
     self._shutdown_future = None
@@ -8572,6 +8582,7 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
     self._workflow_segments_guard = threading.Lock()
     self.client = None
     self._loop_state_by_loop = {}
+    self._live_usage_seen = OrderedDict()
     self._loop_state_futures = {}
     self._builder_waiters = {}
     self._workflow_segments = {}
@@ -9604,14 +9615,23 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
     if (
         event_type == "LIVE_USAGE"
         and isinstance(live_usage, dict)
-        and _live_usage_marker(event_data.source_event)
+        and _live_usage_marker(
+            event_data.source_event.custom_metadata
+            if event_data.source_event is not None
+            else event_data.custom_metadata
+        )
     ):
       connection_id = live_usage.pop("connection_id", None)
     attributes, attrs_truncated = _recursive_smart_truncate(
         attributes, self.config.max_content_length
     )
     if connection_id is not None:
-      attributes["live_usage"]["connection_id"] = connection_id
+      safe_id, id_truncated = _recursive_smart_truncate(connection_id, -1)
+      attrs_truncated = attrs_truncated or id_truncated
+      if isinstance(attributes, dict) and isinstance(
+          attributes.get("live_usage"), dict
+      ):
+        attributes["live_usage"]["connection_id"] = safe_id
     is_truncated = is_truncated or attrs_truncated
 
     # Serialize attributes to JSON string
@@ -9748,6 +9768,66 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
               ),
           )
 
+  async def _log_live_usage(
+      self, callback_context: CallbackContext, response: LlmResponse
+  ) -> None:
+    """Records the first observation of a report within a bounded history."""
+    marker = _live_usage_marker(response.custom_metadata)
+    usage = response.usage_metadata
+    if (
+        marker is None
+        or usage is None
+        or not self.config.enabled
+        or self._is_shutting_down
+        or self._event_type_filtered("LIVE_USAGE")
+    ):
+      return
+    if self._init_pid and self._init_pid != os.getpid():
+      self._reset_runtime_state()
+    key = (str.__str__(marker["connection_id"]), marker["sequence"])
+    reservation = object()
+    # Plugin instances can be shared by threads. Never hold this across I/O.
+    with self._loop_states_guard:
+      if key in self._live_usage_seen:
+        self._live_usage_seen.move_to_end(key)
+        return
+      self._live_usage_seen[key] = reservation
+      if len(self._live_usage_seen) > 1024:
+        self._live_usage_seen.popitem(last=False)
+    try:
+      await self._log_event(
+          "LIVE_USAGE",
+          callback_context,
+          raw_content={
+              "usage": {
+                  "prompt": usage.prompt_token_count,
+                  "completion": usage.candidates_token_count,
+                  "total": usage.total_token_count,
+              }
+          },
+          event_data=EventData(
+              source_event=response if isinstance(response, Event) else None,
+              custom_metadata=response.custom_metadata,
+              model_version=response.model_version,
+              usage_metadata=usage.model_dump(mode="json", exclude_none=True),
+              cache_metadata=getattr(response, "cache_metadata", None),
+              extra_attributes={
+                  "live_usage": {
+                      "connection_id": marker["connection_id"],
+                      "sequence": marker["sequence"],
+                      "live_session_id": response.live_session_id,
+                      "api_backend": marker.get("api_backend"),
+                      "service_tier": marker.get("service_tier"),
+                  }
+              },
+          ),
+      )
+    except BaseException:
+      with self._loop_states_guard:
+        if self._live_usage_seen.get(key) is reservation:
+          self._live_usage_seen.pop(key)
+      raise
+
   @_safe_callback
   async def on_event_callback(
       self,
@@ -9786,35 +9866,10 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
     """
     callback_ctx = CallbackContext(invocation_context)
 
-    live_usage = _live_usage_marker(event)
+    event_metadata = getattr(event, "custom_metadata", None)
+    live_usage = _live_usage_marker(event_metadata)
     if live_usage is not None and event.usage_metadata is not None:
-      usage = event.usage_metadata
-      await self._log_event(
-          "LIVE_USAGE",
-          callback_ctx,
-          raw_content={
-              "usage": {
-                  "prompt": usage.prompt_token_count,
-                  "completion": usage.candidates_token_count,
-                  "total": usage.total_token_count,
-              }
-          },
-          event_data=EventData(
-              source_event=event,
-              model_version=event.model_version,
-              usage_metadata=usage.model_dump(mode="json", exclude_none=True),
-              cache_metadata=getattr(event, "cache_metadata", None),
-              extra_attributes={
-                  "live_usage": {
-                      "connection_id": live_usage.get("connection_id"),
-                      "sequence": live_usage.get("sequence"),
-                      "live_session_id": event.live_session_id,
-                      "api_backend": live_usage.get("api_backend"),
-                      "service_tier": live_usage.get("service_tier"),
-                  }
-              },
-          ),
-      )
+      await self._log_live_usage(callback_ctx, event)
       if (
           event.content is None
           and event.error_code is None
@@ -9823,6 +9878,14 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
               exclude={"state_delta"}, exclude_defaults=True, exclude_none=True
           )
           and getattr(event, "output", None) is None
+          and not event.long_running_tool_ids
+          and not (
+              isinstance(event_metadata, dict)
+              and (
+                  "a2a:request" in event_metadata
+                  or "a2a:response" in event_metadata
+              )
+          )
       ):
         return
 
@@ -10448,6 +10511,7 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
         agent: The agent instance.
         callback_context: The callback context.
     """
+    TraceManager.pop_span(expected_kind="llm_request")
     span_id, duration = TraceManager.pop_span()
     parent_span_id, _ = TraceManager.get_current_span_and_parent()
 
@@ -10524,8 +10588,6 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
       )
       attributes["tools"] = tools
 
-    # A usage-only predecessor may have ended without a final content frame.
-    TraceManager.pop_span(expected_kind="llm_request")
     TraceManager.push_span(callback_context, "llm_request")
     await self._log_event(
         "LLM_REQUEST",
@@ -10556,7 +10618,10 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
     SSE produces one terminal response per model call, while legacy aggregators
     and mixed LiteLLM streams can emit multiple terminal responses.
 
-    Native standalone Live snapshots are recorded as LIVE_USAGE by on_event.
+    Live reports are recorded on first sight in after_model or on_event,
+    including evaluation routes with no on_event callback. The most recent
+    1,024 report identities are retained to suppress duplicate observations;
+    this is best-effort analytics, not durable exactly-once delivery.
     CFC users querying v_llm_response for tokens should also read v_live_usage.
     If LIVE_USAGE is filtered, CFC retains its LLM_RESPONSE usage fallback.
 
@@ -10564,18 +10629,28 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
         callback_context: The callback context.
         llm_response: The LLM response object.
     """
-    live_usage = _live_usage_marker(llm_response)
-    defer_usage = (
+    live_usage = _live_usage_marker(
+        getattr(llm_response, "custom_metadata", None)
+    )
+    separate_usage = (
         live_usage is not None
         and llm_response.usage_metadata is not None
         and not self._event_type_filtered("LIVE_USAGE")
     )
+    if separate_usage:
+      await self._log_live_usage(callback_context, llm_response)
+    usage_only = (
+        live_usage is not None
+        and llm_response.usage_metadata is not None
+        and llm_response.content is None
+        and llm_response.error_code is None
+    )
     if (
-        defer_usage
+        separate_usage
         and llm_response.content is None
         and llm_response.error_code is None
     ):
-      # CFC also calls this hook for live events; on_event owns their usage.
+      # Content-bearing responses still keep their separate model row.
       return
     is_partial = getattr(llm_response, "partial", None) is True
     content_dict: dict[str, object] = {}
@@ -10589,7 +10664,7 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
       if part_truncated:
         is_truncated = True
 
-    usage_metadata = None if defer_usage else llm_response.usage_metadata
+    usage_metadata = None if separate_usage else llm_response.usage_metadata
     if usage_metadata:
       usage = usage_metadata
       usage_dict = {}
@@ -10611,14 +10686,14 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
     _, parent_span_id = TraceManager.get_current_span_and_parent()
 
     is_popped = False
-    duration = 0
+    duration: Optional[int] = None if usage_only else 0
     tfft = None
     extra_attributes: dict[str, Any] = {}
     cache_metadata = getattr(llm_response, "cache_metadata", None)
 
     if is_partial:
       # Streaming chunk - do NOT pop span yet
-      if span_id:
+      if span_id and not usage_only:
         TraceManager.record_first_token(span_id)
         start_time = TraceManager.get_start_time(span_id)
         first_token = TraceManager.get_first_token_time(span_id)
@@ -10629,7 +10704,7 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
     else:
       # Final response - pop span
       start_time = None
-      if span_id:
+      if span_id and not usage_only:
         # Ensure we have first token time even if it wasn't streaming (or single chunk)
         TraceManager.record_first_token(span_id)
         start_time = TraceManager.get_start_time(span_id)
@@ -10638,11 +10713,13 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
           tfft = int((first_token - start_time) * 1000)
 
       # ACTUALLY pop the span
-      popped_span_id, popped_duration = TraceManager.pop_span(
-          expected_kind="llm_request"
-      )
-      duration = popped_duration or 0
-      is_popped = True
+      popped_span_id = None
+      if not usage_only:
+        popped_span_id, popped_duration = TraceManager.pop_span(
+            expected_kind="llm_request"
+        )
+        duration = popped_duration or 0
+        is_popped = True
 
       # If we popped, the span_id from get_current_span_and_parent() above is correct for THIS event
       # Wait, if we popped, get_current_span_and_parent() now returns parent.
@@ -10688,7 +10765,11 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
             latency_ms=duration,
             time_to_first_token_ms=tfft,
             model_version=llm_response.model_version,
-            usage_metadata=usage_metadata,
+            usage_metadata=(
+                usage_metadata.model_dump(mode="json", exclude_none=True)
+                if isinstance(usage_metadata, BaseModel)
+                else usage_metadata
+            ),
             cache_metadata=cache_metadata,
             finish_reason=(
                 getattr(finish_reason, "name", str(finish_reason))

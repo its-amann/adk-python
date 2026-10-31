@@ -14,6 +14,7 @@
 
 """Unit tests for _model_response_finalizer module."""
 
+import copy
 from unittest import mock
 from unittest.mock import AsyncMock
 
@@ -337,6 +338,150 @@ async def test_after_model_preserves_same_object_edits():
   assert result is response
   assert response.usage_metadata is None
   assert response.custom_metadata == {LIVE_USAGE_KEY: marker}
+
+
+@pytest.mark.parametrize("plugin_callback", [False, True])
+async def test_after_model_does_not_contaminate_reused_replacement(
+    plugin_callback,
+):
+  """A cached response must not carry Live identity into a later unary call."""
+  replacement = LlmResponse(
+      content=types.Content(parts=[types.Part(text="cached")]),
+      custom_metadata={"user_tag": "cached"},
+  )
+  saved_replacement = replacement.model_dump()
+  callback = AsyncMock(return_value=replacement)
+  agent = Agent(
+      name="test_agent",
+      after_model_callback=None if plugin_callback else callback,
+  )
+  plugins = []
+  if plugin_callback:
+    plugin = BasePlugin(name="cached-response")
+    plugin.after_model_callback = callback
+    plugins.append(plugin)
+  context = await testing_utils.create_invocation_context(
+      agent=agent, plugins=plugins
+  )
+  marker = {"connection_id": "connection-1", "sequence": 1}
+  live = LlmResponse(
+      custom_metadata={LIVE_USAGE_KEY: marker},
+      usage_metadata=types.GenerateContentResponseUsageMetadata(
+          total_token_count=15
+      ),
+  )
+  unary = LlmResponse(
+      usage_metadata=types.GenerateContentResponseUsageMetadata(
+          total_token_count=100
+      ),
+  )
+
+  live_result = await _model_response_finalizer.handle_after_model_callback(
+      context, live, Event(author=agent.name)
+  )
+  after_live = replacement.model_dump()
+  unary_result = await _model_response_finalizer.handle_after_model_callback(
+      context, unary, Event(author=agent.name)
+  )
+
+  assert after_live == saved_replacement
+  assert replacement.model_dump() == saved_replacement
+  assert live_result is not replacement
+  assert live_result.custom_metadata == {
+      "user_tag": "cached",
+      LIVE_USAGE_KEY: marker,
+  }
+  assert live_result.usage_metadata.total_token_count == 15
+  assert unary_result is not replacement
+  assert unary_result.custom_metadata == {"user_tag": "cached"}
+  assert unary_result.usage_metadata.total_token_count == 100
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "usage_metadata",
+        "partial",
+        "turn_complete",
+        "model_version",
+        "live_session_id",
+    ],
+)
+async def test_after_model_replacement_respects_fields_cleared_by_plugin(
+    field_name,
+):
+  """A later replacement inherits the current fields, not an old snapshot."""
+  marker = {"connection_id": "connection-1", "sequence": 1}
+  original = LlmResponse(
+      custom_metadata={LIVE_USAGE_KEY: marker},
+      usage_metadata=types.GenerateContentResponseUsageMetadata(
+          total_token_count=15
+      ),
+      partial=True,
+      turn_complete=False,
+      model_version="live-model",
+      live_session_id="provider-session",
+  )
+
+  async def clear_field(*, callback_context, llm_response):
+    del callback_context
+    setattr(llm_response, field_name, None)
+
+  plugin = BasePlugin(name="field-editor")
+  plugin.after_model_callback = clear_field
+  replacement = LlmResponse(
+      content=types.Content(parts=[types.Part(text="replacement")])
+  )
+  agent = Agent(
+      name="test_agent",
+      after_model_callback=AsyncMock(return_value=replacement),
+  )
+  context = await testing_utils.create_invocation_context(
+      agent=agent, plugins=[plugin]
+  )
+
+  result = await _model_response_finalizer.handle_after_model_callback(
+      context, original, Event(author=agent.name)
+  )
+
+  assert getattr(result, field_name) is None
+  assert result.custom_metadata == {LIVE_USAGE_KEY: marker}
+  assert replacement.custom_metadata is None
+
+
+@pytest.mark.parametrize("edit", ["clear", "nested"])
+async def test_after_model_canonical_callbacks_each_see_owned_metadata(edit):
+  """Each agent callback sees original identity and earlier public edits."""
+  marker = {"connection_id": "connection-1", "sequence": 1}
+  original = LlmResponse(custom_metadata={LIVE_USAGE_KEY: dict(marker)})
+  observed = []
+
+  def edit_metadata(callback_context, llm_response):
+    del callback_context
+    if edit == "clear":
+      llm_response.custom_metadata.clear()
+    else:
+      llm_response.custom_metadata[LIVE_USAGE_KEY]["sequence"] = 99
+    llm_response.custom_metadata["user_tag"] = "voice"
+
+  def observe_metadata(callback_context, llm_response):
+    del callback_context
+    observed.append(copy.deepcopy(llm_response.custom_metadata))
+
+  agent = Agent(
+      name="test_agent",
+      after_model_callback=[edit_metadata, observe_metadata],
+  )
+  context = await testing_utils.create_invocation_context(agent=agent)
+
+  result = await _model_response_finalizer.handle_after_model_callback(
+      context, original, Event(author=agent.name)
+  )
+
+  expected = {LIVE_USAGE_KEY: marker, "user_tag": "voice"}
+  assert observed == [expected]
+  assert result is None
+  assert original.custom_metadata == expected
 
 
 @pytest.mark.parametrize("kind", ["copy", "fresh", "inplace", "nested"])

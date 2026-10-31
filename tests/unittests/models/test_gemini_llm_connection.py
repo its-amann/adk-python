@@ -24,7 +24,7 @@ import pytest
 MODEL_VERSION = 'gemini-2.5-pro'
 
 
-@pytest.mark.parametrize('backend', list(GoogleLLMVariant))
+@pytest.mark.parametrize('backend', [*GoogleLLMVariant, 'VERTEX_AI', None])
 async def test_live_usage_identifies_each_connection_and_orders_snapshots(
     backend,
 ):
@@ -64,7 +64,7 @@ async def test_live_usage_identifies_each_connection_and_orders_snapshots(
   assert [key['sequence'] for key in third_keys] == [1, 2, 3]
   assert len({key['connection_id'] for key in first_keys + second_keys}) == 1
   assert third_keys[0]['connection_id'] != first_keys[0]['connection_id']
-  assert first_keys[0]['api_backend'] == backend.value
+  assert first_keys[0]['api_backend'] == getattr(backend, 'value', backend)
   assert first_keys[0]['service_tier'] == 'priority'
   assert [
       r.usage_metadata.total_token_count for r in first if r.usage_metadata

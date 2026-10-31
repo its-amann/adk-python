@@ -256,6 +256,10 @@ def _inherit_unset_model_fields(
 
   An explicitly set value on the replacement is always respected.
 
+  Unset model_version and live_session_id are inherited too. Reserved metadata
+  from the current response is merged into a copy, with original reserved
+  values taking precedence. The callback's replacement is never modified.
+
   Args:
     original: The response being replaced.
     replacement: The callback-provided response, if there is one.
@@ -287,8 +291,9 @@ def _inherit_unset_model_fields(
     ):
       updates[field] = getattr(original, field)
   if owned_metadata := internal_metadata(original.custom_metadata):
+    existing = replacement.custom_metadata
     metadata = {
-        **(replacement.custom_metadata or {}),
+        **(existing if isinstance(existing, Mapping) else {}),
         **owned_metadata,
     }
     if metadata != replacement.custom_metadata:
@@ -323,11 +328,6 @@ async def handle_after_model_callback(
       internal_metadata(getattr(llm_response, 'custom_metadata', None))
       if isinstance(llm_response, LlmResponse)
       else {}
-  )
-  original_response = (
-      llm_response.model_copy(update={'custom_metadata': owned_metadata})
-      if owned_metadata
-      else llm_response
   )
 
   # Add grounding metadata to the response if needed.
@@ -368,25 +368,38 @@ async def handle_after_model_callback(
     # If no overrides are provided from the plugins, further run the canonical
     # callbacks.
     if not callback_response:
-      callback_response = await _run_callbacks(
-          agent.canonical_after_model_callbacks,  # type: ignore[arg-type]
-          _stop_on_truthy,
-          callback_context=callback_context,
-          llm_response=llm_response,
-          callback_type=CallbackType.AFTER_MODEL,
-      )
+      for callback in agent.canonical_after_model_callbacks:
+        try:
+          callback_response = await _run_callbacks(
+              [callback],  # type: ignore[arg-type]
+              _stop_on_truthy,
+              callback_context=callback_context,
+              llm_response=llm_response,
+              callback_type=CallbackType.AFTER_MODEL,
+          )
+        finally:
+          if owned_metadata and isinstance(llm_response, LlmResponse):
+            existing = llm_response.custom_metadata
+            metadata = {
+                **(existing if isinstance(existing, Mapping) else {}),
+                **copy.deepcopy(owned_metadata),
+            }
+            if metadata != existing:
+              llm_response.custom_metadata = metadata
+        if callback_response:
+          break
     callback_response = await _maybe_add_grounding_metadata(callback_response)
-    surviving_response = (
-        callback_response if callback_response is not None else llm_response
-    )
-    if owned_metadata and isinstance(surviving_response, LlmResponse):
-      surviving_response.custom_metadata = {
-          **(surviving_response.custom_metadata or {}),
+    if owned_metadata and isinstance(llm_response, LlmResponse):
+      existing = llm_response.custom_metadata
+      metadata = {
+          **(existing if isinstance(existing, Mapping) else {}),
           **owned_metadata,
       }
+      if metadata != existing:
+        llm_response.custom_metadata = metadata
     if callback_response is llm_response:
       return callback_response
-    return _inherit_unset_model_fields(original_response, callback_response)
+    return _inherit_unset_model_fields(llm_response, callback_response)
 
 
 async def run_and_handle_error(

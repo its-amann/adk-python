@@ -352,7 +352,9 @@ class GeminiLlmConnection(BaseLlmConnection):
                   LIVE_USAGE_KEY: {
                       'connection_id': self._usage_connection_id,
                       'sequence': self._usage_sequence,
-                      'api_backend': self._api_backend.value,
+                      'api_backend': getattr(
+                          self._api_backend, 'value', self._api_backend
+                      ),
                       'service_tier': getattr(
                           service_tier, 'value', service_tier
                       ),

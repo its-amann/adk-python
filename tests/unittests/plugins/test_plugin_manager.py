@@ -17,18 +17,23 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 from unittest.mock import AsyncMock
 from unittest.mock import Mock
 
 from google.adk.agents import CallbackInfo
 from google.adk.agents import CallbackType
 from google.adk.agents.callback_context import CallbackContext
+from google.adk.events._internal_metadata import INTERNAL_METADATA_PREFIX
+from google.adk.events._internal_metadata import LIVE_USAGE_KEY
+from google.adk.events.event import Event
 from google.adk.models.llm_response import LlmResponse
 from google.adk.plugins.base_plugin import BasePlugin
 # Assume the following path to your modules
 # You might need to adjust this based on your project structure.
 from google.adk.plugins.plugin_manager import PluginCallbackName
 from google.adk.plugins.plugin_manager import PluginManager
+from pydantic import ConfigDict
 import pytest
 
 
@@ -194,6 +199,220 @@ async def test_normal_flow_all_plugins_are_called(
   # Both plugins must have been called.
   assert "before_run_callback" in plugin1.call_log
   assert "before_run_callback" in plugin2.call_log
+
+
+@pytest.mark.parametrize(
+    "callback_name, target_name, context_name",
+    [
+        ("after_model_callback", "llm_response", "callback_context"),
+        ("on_event_callback", "event", "invocation_context"),
+    ],
+)
+@pytest.mark.parametrize("edit", ["none", "nonmapping", "nested"])
+async def test_each_plugin_sees_owned_metadata_after_edits(
+    service, plugin1, plugin2, callback_name, target_name, context_name, edit
+):
+  """Metadata edits cannot hide original identity from the next plugin."""
+  marker = {"connection_id": "connection-1", "sequence": 1}
+  metadata = {LIVE_USAGE_KEY: dict(marker)}
+  response = (
+      Event(author="test_agent", custom_metadata=metadata)
+      if target_name == "event"
+      else LlmResponse(custom_metadata=metadata)
+  )
+  observed = []
+
+  async def edit_metadata(**kwargs):
+    target = kwargs[target_name]
+    if edit == "none":
+      target.custom_metadata = None
+    elif edit == "nonmapping":
+      target.custom_metadata = "not a mapping"
+    else:
+      target.custom_metadata[LIVE_USAGE_KEY]["sequence"] = 99
+      target.custom_metadata["user_tag"] = "voice"
+      target.custom_metadata[INTERNAL_METADATA_PREFIX + "plugin_owned"] = True
+
+  async def observe_metadata(**kwargs):
+    target = kwargs[target_name]
+    observed.append(copy.deepcopy(target.custom_metadata))
+    target.custom_metadata["observer_tag"] = "kept"
+
+  setattr(plugin1, callback_name, edit_metadata)
+  setattr(plugin2, callback_name, observe_metadata)
+  service.register_plugin(plugin1)
+  service.register_plugin(plugin2)
+
+  result = await getattr(service, f"run_{callback_name}")(
+      **{target_name: response, context_name: Mock()}
+  )
+
+  expected = {LIVE_USAGE_KEY: marker}
+  if edit == "nested":
+    expected.update({
+        "user_tag": "voice",
+        INTERNAL_METADATA_PREFIX + "plugin_owned": True,
+    })
+  assert result is None
+  assert observed == [expected]
+  assert response.custom_metadata == {**expected, "observer_tag": "kept"}
+
+
+@pytest.mark.parametrize(
+    "callback_name, target_name, context_name",
+    [
+        ("after_model_callback", "llm_response", "callback_context"),
+        ("on_event_callback", "event", "invocation_context"),
+    ],
+)
+@pytest.mark.parametrize("raises", [False, True])
+async def test_readonly_callback_lookalikes_keep_results_and_errors(
+    service, plugin1, callback_name, target_name, context_name, raises
+):
+  """Metadata protection must not write to compatible read-only objects."""
+  marker = {"connection_id": "connection-1", "sequence": 1}
+
+  class ReadonlyResponse:
+
+    @property
+    def custom_metadata(self):
+      return {LIVE_USAGE_KEY: marker}
+
+  response = ReadonlyResponse()
+  original_error = ValueError("callback failed")
+  if raises:
+    plugin1.exceptions_to_raise[callback_name] = original_error
+  service.register_plugin(plugin1)
+  kwargs = {target_name: response, context_name: Mock()}
+
+  if raises:
+    with pytest.raises(RuntimeError, match="callback failed") as excinfo:
+      await getattr(service, f"run_{callback_name}")(**kwargs)
+    assert excinfo.value.__cause__ is original_error
+  else:
+    result = await getattr(service, f"run_{callback_name}")(**kwargs)
+    assert result is None
+
+  assert plugin1.call_log == [callback_name]
+  assert response.custom_metadata == {LIVE_USAGE_KEY: marker}
+
+
+@pytest.mark.parametrize(
+    "callback_name, target_name, context_name",
+    [
+        ("after_model_callback", "llm_response", "callback_context"),
+        ("on_event_callback", "event", "invocation_context"),
+    ],
+)
+async def test_unchanged_frozen_event_passes_through_plugins(
+    service, plugin1, plugin2, callback_name, target_name, context_name
+):
+  """No-op callbacks must not trigger assignments on a frozen event."""
+
+  class FrozenEvent(Event):
+    model_config = ConfigDict(frozen=True)
+
+  marker = {"connection_id": "connection-1", "sequence": 1}
+  event = FrozenEvent(
+      id="frozen-event",
+      author="test_agent",
+      custom_metadata={LIVE_USAGE_KEY: marker},
+  )
+  service.register_plugin(plugin1)
+  service.register_plugin(plugin2)
+
+  result = await getattr(service, f"run_{callback_name}")(
+      **{target_name: event, context_name: Mock()}
+  )
+
+  assert result is None
+  assert event.custom_metadata == {LIVE_USAGE_KEY: marker}
+  assert plugin1.call_log == [callback_name]
+  assert plugin2.call_log == [callback_name]
+
+
+@pytest.mark.parametrize(
+    "callback_name, target_name, context_name",
+    [
+        ("after_model_callback", "llm_response", "callback_context"),
+        ("on_event_callback", "event", "invocation_context"),
+    ],
+)
+async def test_nonmapping_metadata_does_not_mask_callback_error(
+    service, plugin1, plugin2, callback_name, target_name, context_name
+):
+  """Restore identity after invalid metadata without masking the exception."""
+  marker = {"connection_id": "connection-1", "sequence": 1}
+  metadata = {LIVE_USAGE_KEY: marker}
+  response = (
+      Event(author="test_agent", custom_metadata=metadata)
+      if target_name == "event"
+      else LlmResponse(custom_metadata=metadata)
+  )
+  original_error = ValueError("callback failed after metadata edit")
+
+  async def edit_and_raise(**kwargs):
+    kwargs[target_name].custom_metadata = "not a mapping"
+    raise original_error
+
+  setattr(plugin1, callback_name, edit_and_raise)
+  service.register_plugin(plugin1)
+  service.register_plugin(plugin2)
+
+  with pytest.raises(RuntimeError, match="callback failed") as excinfo:
+    await getattr(service, f"run_{callback_name}")(
+        **{target_name: response, context_name: Mock()}
+    )
+
+  assert excinfo.value.__cause__ is original_error
+  assert response.custom_metadata == {LIVE_USAGE_KEY: marker}
+  assert plugin2.call_log == []
+
+
+@pytest.mark.parametrize(
+    "callback_name, target_name, context_name",
+    [
+        ("after_model_callback", "llm_response", "callback_context"),
+        ("on_event_callback", "event", "invocation_context"),
+    ],
+)
+async def test_replacement_keeps_owned_metadata_without_mutation(
+    service, plugin1, plugin2, callback_name, target_name, context_name
+):
+  """An early replacement is copied, preserving identity and early exit."""
+  marker = {"connection_id": "connection-1", "sequence": 1}
+  original_metadata = {LIVE_USAGE_KEY: dict(marker)}
+  replacement_metadata = {
+      "user_tag": "replacement",
+      LIVE_USAGE_KEY: {"connection_id": "different", "sequence": 99},
+      INTERNAL_METADATA_PREFIX + "plugin_owned": True,
+  }
+  if target_name == "event":
+    original = Event(author="test_agent", custom_metadata=original_metadata)
+    replacement = Event(
+        author="test_agent", custom_metadata=replacement_metadata
+    )
+  else:
+    original = LlmResponse(custom_metadata=original_metadata)
+    replacement = LlmResponse(custom_metadata=replacement_metadata)
+  saved_replacement = replacement.model_dump()
+  plugin1.return_values[callback_name] = replacement
+  service.register_plugin(plugin1)
+  service.register_plugin(plugin2)
+
+  result = await getattr(service, f"run_{callback_name}")(
+      **{target_name: original, context_name: Mock()}
+  )
+
+  assert result is not replacement
+  assert result.custom_metadata == {
+      **replacement_metadata,
+      LIVE_USAGE_KEY: marker,
+  }
+  assert replacement.model_dump() == saved_replacement
+  assert original.custom_metadata == original_metadata
+  assert plugin1.call_log == [callback_name]
+  assert plugin2.call_log == []
 
 
 @pytest.mark.asyncio

@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Mapping
 from contextlib import nullcontext
 import copy
 import logging
@@ -30,6 +31,7 @@ from google.genai import types
 from ..agents._callback_metadata import _callback_scope
 from ..agents._callback_metadata import CallbackType
 from ..events._internal_metadata import internal_metadata
+from ..models.llm_response import LlmResponse
 from .base_plugin import BasePlugin
 
 if TYPE_CHECKING:
@@ -38,7 +40,6 @@ if TYPE_CHECKING:
   from ..agents.invocation_context import InvocationContext
   from ..events.event import Event
   from ..models.llm_request import LlmRequest
-  from ..models.llm_response import LlmResponse
   from ..tools.base_tool import BaseTool
   from ..tools.tool_context import ToolContext
 
@@ -325,12 +326,14 @@ class PluginManager:
         else nullcontext()
     )
 
-    llm_response = kwargs.get("llm_response")
+    owned_target = None
+    if callback_name == "after_model_callback":
+      owned_target = kwargs.get("llm_response")
+    elif callback_name == "on_event_callback":
+      owned_target = kwargs.get("event")
     owned_metadata = (
-        copy.deepcopy(
-            internal_metadata(getattr(llm_response, "custom_metadata", None))
-        )
-        if callback_name == "after_model_callback"
+        copy.deepcopy(internal_metadata(owned_target.custom_metadata))
+        if isinstance(owned_target, LlmResponse)
         else {}
     )
     with callback_scope:
@@ -341,6 +344,18 @@ class PluginManager:
         try:
           result = await callback_method(**kwargs)
           if result is not None:
+            if (
+                owned_metadata
+                and isinstance(result, LlmResponse)
+                and result is not owned_target
+            ):
+              existing = result.custom_metadata
+              metadata = {
+                  **(existing if isinstance(existing, Mapping) else {}),
+                  **copy.deepcopy(owned_metadata),
+              }
+              if metadata != existing:
+                result = result.model_copy(update={"custom_metadata": metadata})
             # Early exit: A plugin has returned a value. We stop
             # processing further plugins and return this value immediately.
             logger.debug(
@@ -358,12 +373,15 @@ class PluginManager:
           logger.error(error_message, exc_info=True)
           raise RuntimeError(error_message) from e
         finally:
-          if owned_metadata and llm_response is not None:
+          if owned_metadata and isinstance(owned_target, LlmResponse):
             # Each later plugin must see the original model-owned identity.
-            llm_response.custom_metadata = {
-                **(llm_response.custom_metadata or {}),
+            existing = owned_target.custom_metadata
+            metadata = {
+                **(existing if isinstance(existing, Mapping) else {}),
                 **copy.deepcopy(owned_metadata),
             }
+            if metadata != existing:
+              owned_target.custom_metadata = metadata
 
     return None
 
