@@ -22,6 +22,7 @@ import copy
 from functools import cached_property
 import json
 import logging
+import re
 from typing import Any
 from typing import AsyncGenerator
 from typing import cast
@@ -430,8 +431,14 @@ class OpenAILlm(BaseLlm):
       tool_choice = _tool_choice(llm_request.config) or "auto"
 
     response_format = None
-    if llm_request.config and llm_request.config.response_schema:
-      schema = llm_request.config.response_schema
+    if llm_request.config and (
+        llm_request.config.response_schema
+        or llm_request.config.response_json_schema
+    ):
+      schema = (
+          llm_request.config.response_schema
+          or llm_request.config.response_json_schema
+      )
       schema_name = "response"
       schema_dict = {}
 
@@ -449,7 +456,11 @@ class OpenAILlm(BaseLlm):
       elif isinstance(schema, dict):
         schema_dict = copy.deepcopy(schema)
         if "title" in schema_dict:
-          schema_name = str(schema_dict["title"])
+          # OpenAI requires the json_schema name to match ^[a-zA-Z0-9_-]+$.
+          schema_name = (
+              re.sub(r"[^a-zA-Z0-9_-]", "_", str(schema_dict["title"]))
+              or "response"
+          )
 
       if schema_dict:
         enforce_strict_openai_schema(schema_dict)

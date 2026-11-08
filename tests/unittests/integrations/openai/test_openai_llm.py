@@ -1772,3 +1772,38 @@ def test_usage_metadata_maps_reasoning_tokens(details, expected):
   metadata = _usage_metadata(usage)
   assert metadata.thoughts_token_count == expected
   assert metadata.candidates_token_count == 50
+
+
+@pytest.mark.asyncio
+async def test_response_json_schema_becomes_json_schema_format():
+  """response_json_schema is honored like on OpenAIResponsesLlm."""
+  with mock.patch.dict(os.environ, {"OPENAI_API_KEY": "test_key"}):
+    openai_llm = OpenAILlm(model="gpt-4o")
+    llm_request = LlmRequest(
+        model="gpt-4o",
+        contents=[Content(role="user", parts=[Part.from_text(text="Hi")])],
+        config=types.GenerateContentConfig(
+            response_json_schema={
+                "title": "Weather Report",
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+            }
+        ),
+    )
+
+    create_kwargs = await _capture_create_kwargs(openai_llm, llm_request)
+
+  assert create_kwargs["response_format"] == {
+      "type": "json_schema",
+      "json_schema": {
+          "name": "Weather_Report",
+          "strict": True,
+          "schema": {
+              "title": "Weather Report",
+              "type": "object",
+              "properties": {"city": {"type": "string"}},
+              "additionalProperties": False,
+              "required": ["city"],
+          },
+      },
+  }
