@@ -472,3 +472,37 @@ def test_register_service_schemes_are_namespaced_per_service_type():
     registry._create_task_store_service("shared://x")
   assert calls == []
   assert registry.create_session_service("shared://x") == "session-service"
+
+
+async def test_sqlite_session_uri_keeps_options_with_encoded_path(
+    registry: service_registry.ServiceRegistry,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+  """An encoded path and a query option are both honored together."""
+  monkeypatch.setattr(
+      "google.adk.sessions.sqlite_session_service.SqliteSessionService",
+      SqliteSessionService,
+  )
+  db_path = tmp_path / "sessions #1.db"
+  writable_service = SqliteSessionService(str(db_path))
+  session = await writable_service.create_session(
+      app_name="app", user_id="user", state={"count": 1}
+  )
+  await writable_service.close()
+
+  session_service = registry.create_session_service(
+      f"sqlite:///{quote(db_path.as_posix())}?mode=ro"
+  )
+  assert isinstance(session_service, SqliteSessionService)
+  try:
+    stored_session = await session_service.get_session(
+        app_name="app", user_id="user", session_id=session.id
+    )
+    assert stored_session is not None
+    assert stored_session.state == {"count": 1}
+    with pytest.raises(sqlite3.OperationalError, match="readonly"):
+      await session_service.create_session(app_name="app", user_id="user")
+  finally:
+    await session_service.close()
+  assert sorted(p.name for p in tmp_path.iterdir()) == ["sessions #1.db"]

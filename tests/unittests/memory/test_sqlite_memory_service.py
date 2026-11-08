@@ -1170,3 +1170,14 @@ async def test_add_session_to_memory_keeps_turns_outside_a_truncated_session(
       app_name="app", user_id="user", query="paris"
   )
   assert [m.content.parts[0].text for m in result.memories] == ["trip to paris"]
+
+
+def test_parse_db_path_reencodes_path_in_connect_uri():
+  from google.adk.memory._sqlite_memory_service import _parse_db_path
+
+  path, connect_path, use_uri = _parse_db_path(
+      "sqlite:///mem%20%231.db?mode=ro"
+  )
+  assert path == "mem #1.db"
+  assert connect_path == "file:mem%20%231.db?mode=ro"
+  assert use_uri is True
