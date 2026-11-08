@@ -514,7 +514,7 @@ class RestApiTool(BaseTool):
         # Reserved characters ('/', '?', '#') are still escaped so a
         # value cannot introduce a query string or fragment.
         path_params[original_k] = _encode_path_param(
-            name=original_k, value=_to_param_string(v)
+            name=original_k, value="" if v is None else _to_param_string(v)
         )
       elif param_location == "query":
         if v is not None:

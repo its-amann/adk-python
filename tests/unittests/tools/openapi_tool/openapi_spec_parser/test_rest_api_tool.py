@@ -2444,9 +2444,10 @@ class TestRestApiTool:
   @patch(
       "google.adk.tools.openapi_tool.openapi_spec_parser.rest_api_tool._request"
   )
+  @pytest.mark.parametrize("value", ["  ", None])
   @pytest.mark.asyncio
   async def test_call_rejects_blank_path_param(
-      self, mock_request, mock_tool_context
+      self, mock_request, mock_tool_context, value
   ):
     """A blank path arg must return a retryable error without a request."""
     tool = RestApiTool(
@@ -2471,7 +2472,7 @@ class TestRestApiTool:
     )
 
     result = await tool.call(
-        args={"pet_id": "  "}, tool_context=mock_tool_context
+        args={"pet_id": value}, tool_context=mock_tool_context
     )
 
     assert "Path parameter 'petId' must not be empty." in result["error"]
