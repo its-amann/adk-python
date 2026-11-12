@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import logging
+import sys
 from typing import Any
 from typing import Optional
 
@@ -53,6 +54,26 @@ _TIMEOUT_EXCEPTIONS: tuple[type[BaseException], ...] = (
 )
 
 
+# LiteLlm raises litellm.Timeout, which is an openai.APITimeoutError, and
+# AnthropicLlm raises anthropic.APITimeoutError. Neither is a TimeoutError.
+_SDK_TIMEOUT_EXCEPTIONS = (
+    ("openai", "APITimeoutError"),
+    ("anthropic", "APITimeoutError"),
+)
+
+
+def _is_timeout_error(exc: BaseException) -> bool:
+  """Returns True for a builtin, google.auth or model SDK timeout."""
+  if isinstance(exc, _TIMEOUT_EXCEPTIONS):
+    return True
+  for module_name, class_name in _SDK_TIMEOUT_EXCEPTIONS:
+    # Only an SDK that is already imported can have raised `exc`.
+    exc_type = getattr(sys.modules.get(module_name), class_name, None)
+    if exc_type is not None and isinstance(exc, exc_type):
+      return True
+  return False
+
+
 def _delay_or_default(value: float | None, default: float) -> float:
   """Returns `default` only when `value` is None, so 0.0 is honored."""
   return default if value is None else value
@@ -63,7 +84,7 @@ def _is_unretried_timeout_error(
     model: BaseLlm | None = None,
 ) -> bool:
   """Returns True when `exc` is a timeout not already retried by `model`."""
-  if not isinstance(exc, _TIMEOUT_EXCEPTIONS):
+  if not _is_timeout_error(exc):
     return False
   if isinstance(model, Gemini):
     # Imported lazily to keep the module import time low.

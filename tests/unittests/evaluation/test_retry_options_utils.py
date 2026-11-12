@@ -131,3 +131,26 @@ def test_timeout_retry_kwargs_skips_when_genai_already_retries_aiohttp_timeouts(
   assert not retry_predicate(
       auth_exceptions.TimeoutError("Already retried by google-genai")
   )
+
+
+@pytest.mark.parametrize("sdk", ["openai", "anthropic"])
+def test_timeout_retry_kwargs_retries_sdk_timeouts(sdk):
+  """LiteLlm and AnthropicLlm judges time out with their SDK's error."""
+  httpx = pytest.importorskip("httpx")
+  sdk_module = pytest.importorskip(sdk)
+  request = LlmRequest(
+      config=types.GenerateContentConfig(
+          http_options=types.HttpOptions(
+              retry_options=types.HttpRetryOptions(
+                  attempts=3, initial_delay=0.0, max_delay=0.0, jitter=0.0
+              )
+          )
+      )
+  )
+  kwargs = _retry_options_utils.timeout_retry_kwargs(request)
+  retry_predicate = kwargs["retry"].predicate
+  timeout = sdk_module.APITimeoutError(
+      request=httpx.Request("POST", "https://example.com")
+  )
+  assert not isinstance(timeout, TimeoutError)
+  assert retry_predicate(timeout)
