@@ -2483,7 +2483,9 @@ class SkillToolset(BaseToolset):
       if skill_name in turn_cache:
         cached = turn_cache[skill_name]
         if isinstance(cached, asyncio.Future):
-          return await cached
+          # Shield the shared fetch: cancelling one waiter must not cancel
+          # the future the fetching caller and other waiters depend on.
+          return await asyncio.shield(cached)
         return cached
 
       loop = asyncio.get_running_loop()

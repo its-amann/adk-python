@@ -4528,6 +4528,54 @@ async def test_load_skill_waiting_on_cancelled_fetch_does_not_hang(
   mock_registry.get_skill.assert_called_once_with(name="skill1")
 
 
+@pytest.mark.asyncio
+async def test_load_skill_cancelled_waiter_does_not_break_shared_fetch(
+    mock_registry, mock_skill1, tool_context_instance
+):
+  """Cancelling a load that waits on another load's fetch leaves that fetch alone."""
+  fetch_started = asyncio.Event()
+  release = asyncio.Event()
+
+  async def get_skill(name):
+    fetch_started.set()
+    await release.wait()
+    return mock_skill1
+
+  mock_registry.get_skill.side_effect = get_skill
+  toolset = skill_toolset.SkillToolset(registry=mock_registry)
+  load_tool = skill_toolset.LoadSkillTool(toolset)
+  tool_context_instance.invocation_id = "shared-turn"
+  tool_context_instance.state.get.return_value = None
+
+  first_load = asyncio.create_task(
+      load_tool.run_async(
+          args={"skill_name": "skill1"}, tool_context=tool_context_instance
+      )
+  )
+  await fetch_started.wait()
+  waiter = asyncio.create_task(
+      load_tool.run_async(
+          args={"skill_name": "skill1"}, tool_context=tool_context_instance
+      )
+  )
+  await asyncio.sleep(0)
+  waiter.cancel()
+  await asyncio.gather(waiter, return_exceptions=True)
+  release.set()
+
+  result = await asyncio.wait_for(first_load, timeout=5)
+  again = await asyncio.wait_for(
+      load_tool.run_async(
+          args={"skill_name": "skill1"}, tool_context=tool_context_instance
+      ),
+      timeout=5,
+  )
+
+  assert result["skill_name"] == "skill1"
+  assert again["skill_name"] == "skill1"
+  mock_registry.get_skill.assert_called_once_with(name="skill1")
+
+
 def test_skill_toolset_disables_invocation_cache():
   """Verify SkillToolset disables tool invocation caching to allow dynamic tools."""
   toolset = skill_toolset.SkillToolset()
